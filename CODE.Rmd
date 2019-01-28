@@ -1,0 +1,1122 @@
+---
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,eval=FALSE)
+```
+
+```{r}
+rm(list=ls())
+#=============
+#part a#
+#=============
+#import some library:
+#setwd("D:/Desktop/LSE/course/ST429-MT/project")
+library(tseries)
+library(timeSeries)
+library(ggplot2)
+library(xts)
+library(QRM)
+library(gridExtra)
+library(evd)
+
+#import and normalise the dataset
+portfolio=read.csv("combined file.csv",header=T)
+names(portfolio)=c("Date","AAPL_price","AMZN_price","GOOG_price","MSFT_price","NFLX_price","S&P500_price")
+#transform portfolio into a timeseries
+portfolio.ts <- xts(portfolio[,-1], as.Date(portfolio$Date, format="%d/%m/%Y"))
+#calculate the log return
+log_return=diff(log(portfolio.ts))
+
+#plot the log return
+stock_list=c("AAPL","AMZN","GOOG","MSFT","NFLX","S&P500")
+stock_number=length(stock_list)
+
+par(mfrow=c(3,2),oma=c(0,0,4,0))
+
+for (i in 1:stock_number){
+  plot.zoo(log_return[,i],xlab="Dates",ylab=paste(stock_list[i], "log retun",seq=" "),main=paste("Log Return of",stock_list[i],"From 2006 to 2018",seq= " "),type="l",ylim=c(-0.4,0.2))
+  abline(h=(mean(as.numeric(log_return[-1,i]))-3*sqrt(var(log_return[-1,i]))),col="red",lty=2)
+  abline(h=(mean(as.numeric(log_return[-1,i]))+3*sqrt(var(log_return[-1,i]))),col="red",lty=2)
+}
+mtext(side=3,line=0,cex=1.5,outer=T, "Line Charts for Log Return")
+
+#plot the adjusted price to view special event:
+for (i in 1:stock_number){
+  plot.zoo(portfolio.ts[,i],xlab="Dates",ylab=paste(stock_list[i], "stock price",seq=" "),main=paste("Adjusted Stock Price of",stock_list[i],"From 2006 to 2018",seq= " "),type="l")
+}
+mtext(side=3,line=0,cex=1.5,outer=T, "Line Charts for Stock Price")
+par(mfrow=c(1,1))
+
+#==============
+#part b#
+#==============
+#use 2006/01/01 - 2007/12/31 as trainning data:
+start_date="2006-01-03"
+end_date="2018-11-01"
+cut_date_1="2007-12-31"
+cut_date_2="2008-01-01"
+portfolio_training <- window(portfolio.ts, start=start_date, end=cut_date_1)
+
+#~~~~~~~~~~~~~~~~~~~~~~~~
+#some common functions:
+#~~~~~~~~~~~~~~~~~~~~~~~~
+##########common function for calculating coefficients of garch(1,1) model###########
+garch_coeff=function(data){
+  stock_list=c("AAPL","AMZN","GOOG","MSFT","NFLX","S&P500")
+  garch_model=matrix(0,nrow=6,ncol=3)
+  for (i in 1:6){
+    garch_model[i,]=garch(data[-1,i],order=c(1,1))$coef
+  }
+  colnames(garch_model)=c("w","a","b")
+  rownames(garch_model)=stock_list
+  return(garch_model)
+}
+
+##########common function for calculating volotility from garch(1,1) model###########
+volatility=function(garch_model,log_return){
+  volatility_result=log_return
+  stock_list=c("AAPL","AMZN","GOOG","MSFT","NFLX","S&P500")
+  for (i in 1:6){
+    volatility_result[2,i]=garch_model[i,1]/(1-garch_model[i,2]-garch_model[i,3])
+    for (j in 3:nrow(volatility_result)){
+      volatility_result[j,i]=garch_model[i,1]+garch_model[i,2]*volatility_result[j-1,i]+garch_model[i,3]*log_return[j-1,i]^2
+    }
+    names(volatility_result)[i]=paste0(stock_list[i],"_volatility")
+  }
+  return(volatility_result)
+}
+
+##########common function to calculate long-term mean###########
+long_term_mean=function(data,moving_window){
+  stock_list=c("AAPL","AMZN","GOOG","MSFT","NFLX","S&P500")
+  long_mean=data
+  long_mean[,]=NA
+  for (i in moving_window:nrow(long_mean)){
+    for (j in 1:6) {
+      long_mean[i,j]=mean(data[(i+1-moving_window):i,j])
+    }
+  }
+  colnames(long_mean)=paste("mean",stock_list)
+  return(long_mean)
+}
+
+##########common function to calculate weights in value strategy###########
+weight_value=function(data_traininig,data_testing,data_full,long_mean,moving_window,volatility_result){
+  stock_list=c("AAPL","AMZN","GOOG","MSFT","NFLX","S&P500")
+  number_training=nrow(data_traininig)
+  weight_result=data_testing[,1:5]
+  weight_result[,]=NA
+  colnames(weight_result)=paste0(stock_list[1:5],"_weight")
+  
+  for (i in 2:nrow(weight_result)){
+    #calculate the covariance matrix of the 5 stocks at each node using the correlation and the estimated volatility from garch(1,1)
+    covariance_matrix_temp=matrix(nrow=5,ncol=5)
+    for (j in 1:5){
+      for (k in 1:5){
+        covariance_matrix_temp[j,k]=sqrt(volatility_result[i+number_training,j])*cor(data_full[(i+number_training-moving_window):(i+number_training),1:5])[j,k]*sqrt(volatility_result[i+number_training,k])
+      }
+    }
+    #(long-run mean of ith node - realised log return of (i-1)th node will be a good estimate of return for the ith node
+    #we use portfolio.optim function to estimate the optimal weights for each node using the previous 250/52/12 datapoints. shorts=True means short seeling is allowed in this strategy. reslow and reshigh defined the lower bound and upper bound of the weights.
+    weight_result[i,]=0.4-unlist(portfolio.optim(x=matrix((as.numeric(long_mean[i+number_training,1:5])-as.numeric(data_testing[i-1,1:5])),ncol=5),shorts=TRUE,reslow=rep(-1,5),reshigh = rep(1,5),covmat=covariance_matrix_temp)[1])
+  }
+  weight_result[1,]=rep(0.2,5) #for the first day of testing,the weight of each stock should be same
+  return(weight_result)
+}
+
+
+##########common function to calculate weights in momentum strategy###########
+weight_momentum=function(data_traininig,data_testing,data_full,moving_window,volatility_result){
+  stock_list=c("AAPL","AMZN","GOOG","MSFT","NFLX","S&P500")
+  number_training=nrow(data_traininig)
+  weight_result=data_testing[,1:5]
+  weight_result[,]=NA
+  colnames(weight_result)=paste0(stock_list[1:5],"_weight")
+  
+  for (i in 2:nrow(weight_result)){
+    covariance_matrix_temp=matrix(nrow=5,ncol=5)
+    for (j in 1:5){
+      for (k in 1:5){
+        covariance_matrix_temp[j,k]=sqrt(volatility_result[i+number_training,j])*cor(data_full[(i+number_training-moving_window):(i+number_training),1:5])[j,k]*sqrt(volatility_result[i+number_training,k])
+      }
+    }
+    weight_result[i,]=unlist(portfolio.optim(x=data_testing[i-1,1:5],shorts=TRUE,reslow=rep(-1,5),reshigh = rep(1,5),covmat=covariance_matrix_temp)[1])
+  }
+  weight_result[1,]=rep(0.2,5) #for the first day of testing,the weight of each stock should be same
+  return(weight_result)
+}
+
+
+##########common function for wealth update###########
+capital_update=function(stock_price,weight,initial_capital){
+  capital=stock_price[,1]
+  capital[,]=NA
+  capital[1,1]=initial_capital
+  individual_wealth=stock_price
+  individual_wealth[,]=NA
+  individual_wealth[1,]=initial_capital*weight[1,]
+  
+  for (i in 2:nrow(capital)){
+    for (j in 1:ncol(stock_price)){
+      individual_wealth[i,j]=as.numeric(capital[i-1,1])*as.numeric(weight[i-1,j])*as.numeric(stock_price[i,j])/as.numeric(stock_price[i-1,j])
+    }
+    capital[i,]=sum(individual_wealth[i,])
+  }
+  return(capital)
+}
+
+##########common function to calculate linearised loss###########
+loss.fn <- function(x,weights,value, linear=FALSE){
+  if ((!(is.vector(x))) & (!(is.matrix(x)))) 
+    stop("x must be vector or matrix with rows corresponding to risk 
+         factor return observations")
+  N <- length(weights)
+  T <- 1
+  if (is.matrix(x)) T <- dim(x)[1]
+  weight.mat <- matrix(weights,nrow=T,ncol=N,byrow=TRUE)
+  tmp.mat <- value * weight.mat
+  if (linear) { summand <- x*tmp.mat } else { summand <- (exp(x)-1)*tmp.mat }
+  loss <- -rowSums(summand)
+  return(loss)
+}
+#------------------------------------------
+#rebalance period = daily
+#------------------------------------------
+log_return_daily_training=window(log_return,start=start_date,end=cut_date_1)
+log_return_daily_testing=window(log_return,start=cut_date_2,end=end_date)
+moving_window_daily=250
+
+##########estiate the volatility of each day##########
+garch_model_daily=garch_coeff(log_return_daily_training)
+
+#use garch(1,1) coefficients to estimate volitility at each node:
+volatility_daily=volatility(garch_model_daily,log_return)
+
+#######value strategy#######
+##long-term mean##  update daily
+long_mean_daily=long_term_mean(log_return,250)
+
+#####calculate daily weights######
+weights_value_daily=weight_value(log_return_daily_training,log_return_daily_testing,log_return,long_mean_daily,250,volatility_daily)
+
+####calculate total wealth at the end of each day for Value Trading Strategy
+stock_price_daily=portfolio.ts[index(log_return),]
+stock_price_daily_testing=window(stock_price_daily,start=cut_date_2,end=end_date)
+capital_value_daily=capital_update(stock_price_daily_testing[,1:5],weights_value_daily,5000)
+colnames(capital_value_daily)="capital_value_daily"
+
+
+
+######### momentum strategy:daily #################
+#calculate weights for each stocks:
+weights_momentum_daily=weight_momentum(log_return_daily_training,log_return_daily_testing,log_return,250,volatility_daily)
+
+####calculate total wealth at the end of each day
+capital_momentum_daily=capital_update(stock_price_daily_testing[,1:5],weights_momentum_daily,5000)
+colnames(capital_momentum_daily)="capital_momentum_daily"
+
+#-------------------------------------------
+#rebalance period = 1 week
+#-------------------------------------------
+log_return_weekly=apply.weekly(log_return, function(x) apply(x, 2, sum)) 
+log_return_weekly_training=window(log_return_weekly,start=start_date,end=cut_date_1)
+log_return_weekly_testing=window(log_return_weekly,start=cut_date_2,end=end_date)
+moving_window_weekly<-52
+
+##########estiate the volatility of each stock at each weekly node##########
+garch_model_weekly=garch_coeff(log_return_weekly_training)
+
+#use garch(1,1) coefficients to estimate volitility at each node:
+#estimate v0=w/(1-a-b), i.e long-run mean
+volatility_weekly=volatility(garch_model_weekly,log_return_weekly)
+
+######### momentum strategy #################
+#calculate weights for each stocks:
+weights_momentum_weekly=weight_momentum(log_return_weekly_training,log_return_weekly_testing,log_return_weekly,52,volatility_weekly)
+
+
+####calculate total wealth at the end of each day
+stock_price_weekly=portfolio.ts[index(log_return_weekly),]
+stock_price_weekly_testing=window(stock_price_weekly,start=cut_date_2,end=end_date)
+capital_momentum_weekly=capital_update(stock_price_weekly_testing[,1:5],weights_momentum_weekly,5000)
+colnames(capital_momentum_weekly)="capital_momentum_weekly"
+
+
+#######value strategy#######
+##long-term mean##
+long_mean_weekly=long_term_mean(log_return_weekly,52)
+
+#####calculate weights######
+weights_value_weekly=weight_value(log_return_weekly_training,log_return_weekly_testing,log_return_weekly,long_mean_weekly,52,volatility_weekly)
+
+####calculate total wealth at the end of each day
+capital_value_weekly=capital_update(stock_price_weekly_testing[,1:5],weights_value_weekly,5000)
+colnames(capital_value_weekly)="capital_value_weekly"
+
+
+#--------------------------------------------
+#rebalance period = 1 month
+#--------------------------------------------
+log_return_monthly=apply.monthly(log_return, function(x) apply(x, 2, sum)) 
+log_return_monthly_training=window(log_return_monthly,start=start_date,end=cut_date_1)
+log_return_monthly_testing=window(log_return_monthly,start=cut_date_2,end=end_date)
+moving_window_monthly<-12
+
+
+##########estiate the volatility of each stock at each monthly node##########
+#use the monthly log return of training dataset to estimate garch (1,1) for each stock and store the coefficients in the garch_model_monthly matrix
+garch_model_monthly=garch_coeff(log_return_monthly_training)
+
+#use garch(1,1) coefficients to estimate volitility at each node:
+#estimate v0=w/(1-a-b), i.e long-run mean
+volatility_monthly=volatility(garch_model_monthly,log_return_monthly)
+
+#######value strategy#######
+##long-term mean##
+long_mean_monthly=long_term_mean(log_return_monthly,12)
+
+#####calculate weights######
+weights_value_monthly=weight_value(log_return_monthly_training,log_return_monthly_testing,log_return_monthly,long_mean_monthly,12,volatility_monthly)
+
+
+####calculate total wealth at the end of each month
+stock_price_monthly=portfolio.ts[index(log_return_monthly),]
+stock_price_monthly_testing=window(stock_price_monthly,start=cut_date_2,end=end_date)
+capital_value_monthly=capital_update(stock_price_monthly_testing[,1:5],weights_value_monthly,5000)
+colnames(capital_value_monthly)="capital_value_monthly"
+
+
+######### momentum strategy #################
+#calculate weights for each stocks:
+weights_momentum_monthly=weight_momentum(log_return_monthly_training,log_return_monthly_testing,log_return_monthly,12,volatility_monthly)
+
+####calculate total wealth at the end of each month
+capital_momentum_monthly=capital_update(stock_price_monthly_testing[,1:5],weights_momentum_monthly,5000)
+colnames(capital_momentum_monthly)="capital_momentum_monthly"
+
+
+######## compare the performance of these two portfolio and the SP500 ########
+# daily 
+portfolio_daily_testing<-window(portfolio.ts, start=cut_date_2, end=end_date)
+SP500_daily<-portfolio_daily_testing$`S&P500_price`*(5000/1268)
+daily_comparison<-xts(cbind(SP500_daily,capital_momentum_daily,capital_value_daily))
+colnames(daily_comparison)<-c("S&P500","Momentum Strategy","Value Strategy")
+
+daily.plot<-ggplot(daily_comparison,aes(x = index(daily_comparison)))+
+  geom_line(aes(y = daily_comparison[,1], color = "S&P500"))+
+  ggtitle("Comparison Between Daily Rebalanced Strategies and S&P500") +
+  geom_line(aes(y = daily_comparison[,2], color = "Momentum Strategy")) +
+  geom_line(aes(y = daily_comparison[,3], color = "Value Strategy")) +
+  xlab("Date") + ylab("Total Value") +
+  theme(plot.title = element_text(hjust = 0.5), panel.border = element_blank()) +
+  scale_x_date(date_labels = "%m/%y") +
+  scale_colour_manual("", values=c("S&P500"="gray40", "Momentum Strategy"="firebrick4", "Value Strategy"="darkcyan"))+
+  theme(legend.position="bottom")
+
+
+# weekly
+SP500_weekly<-to.weekly(portfolio_daily_testing$`S&P500_price`)[,4]*(5000/1268)
+weekly_comparison<-xts(cbind(SP500_weekly,capital_momentum_weekly,capital_value_weekly))
+colnames(weekly_comparison)<-c("S&P500","Momentum Strategy","Value Strategy")
+weekly.plot<-ggplot(weekly_comparison,aes(x = index(weekly_comparison)))+
+  geom_line(aes(y = weekly_comparison[,1], color = "S&P500"))+
+  ggtitle("Comparison Between Weekly Rebalanced Strategies and S&P500") +
+  geom_line(aes(y = weekly_comparison[,2], color = "Momentum Strategy")) +
+  geom_line(aes(y = weekly_comparison[,3], color = "Value Strategy")) +
+  xlab("Date") + ylab("Total Value") +
+  theme(plot.title = element_text(hjust = 0.5), panel.border = element_blank()) +
+  scale_x_date(date_labels = "%m/%y") +
+  scale_colour_manual("", values=c("S&P500"="gray40", "Momentum Strategy"="firebrick4", "Value Strategy"="darkcyan"))+
+  theme(legend.position="bottom")
+
+# monthly
+SP500_monthly<-to.monthly(portfolio_daily_testing$`S&P500_price`)[,4]*(5000/1268)
+colnames(SP500_monthly)<-"S&P500"
+colnames(capital_momentum_monthly[,1])<-"Momentum Strategy"
+colnames(capital_value_monthly[,1])<-"Value Strategy"
+
+monthly.plot<-ggplot(SP500_monthly,aes(x = index(capital_momentum_monthly)))+
+  geom_line(aes(y =SP500_monthly, color = "S&P500"))+
+  ggtitle("Comparison Between Monthly Rebalanced Strategies and S&P500") +
+  geom_line(aes(y =capital_momentum_monthly[,1], color = "Momentum Strategy")) +
+  geom_line(aes(y = capital_value_monthly[,1], color = "Value Strategy")) +
+  xlab("Date") + ylab("Total Value") +
+  scale_x_date(date_labels = "%m/%y") +
+  theme(plot.title = element_text(hjust = 0.5), panel.border = element_blank()) +
+  scale_colour_manual("", values=c("S&P500"="gray40", "Momentum Strategy"="firebrick4", "Value Strategy"="darkcyan"))+
+  theme(legend.position="bottom")
+
+
+
+#===============
+#part c
+#===============
+
+#---------------------------
+# Daily Rebalance
+#---------------------------
+##use AR(1) model to predict the return.
+number_training_daily<-nrow(log_return_daily_training)
+ar_model_daily=log_return_daily_testing[,1:5]
+ar_model_daily[,]=NA
+for (i in 1:nrow(ar_model_daily)){
+  for (j in 1:(stock_number-1)){
+    ar_model_daily[i,j]=arima(log_return[(number_training_daily+i-1-moving_window_daily):(number_training_daily+i-1),j],order=c(1,0,0))$coef[1]
+  }
+}
+
+#use the coefficient to predict the log_return at the next datapoint
+log_return_daily_ac=log_return_daily_testing[,1:5]
+log_return_daily_ac[,]=NA
+for (i in 1:nrow(log_return_daily_ac)){
+  for (j in 1:(stock_number-1)){
+    log_return_daily_ac[i,j]=as.numeric(ar_model_daily[i,j])*as.numeric(log_return[(i+number_training_daily-1),j])
+  }
+}
+
+##calcualte the weights
+weights_ac_daily=log_return_daily_testing[,1:5]
+weights_ac_daily[,]=NA
+colnames(weights_ac_daily)=paste0(stock_list[1:5],"_weight")
+
+for (i in 2:nrow(weights_ac_daily)){
+  covariance_matrix_temp=matrix(nrow=5,ncol=5)
+  for (j in 1:5){
+    for (k in 1:5){
+      covariance_matrix_temp[j,k]=sqrt(volatility_daily[i+number_training_daily,j])*cor(log_return[(i+number_training_daily-moving_window_daily):(i+number_training_daily),1:5])[j,k]*sqrt(volatility_daily[i+number_training_daily,k])
+    }
+  }
+  weights_ac_daily[i,]=0.4-unlist(portfolio.optim(log_return_daily_ac[i-1,1:5],shorts=TRUE,reslow=rep(-1,5),reshigh = rep(1,5),covmat=covariance_matrix_temp)[1])
+  rm(covariance_matrix_temp)
+}
+weights_ac_daily[1,]=rep(0.2,5)
+
+####calculate total wealth at the end of each day
+capital_ac_daily=capital_update(stock_price_daily_testing[,1:5],weights_ac_daily,5000)
+colnames(capital_ac_daily)="capital_autocorrelation_daily"
+
+
+#========================
+#Rebalance: Weekly
+#========================
+##use AR(1) model to predict the return. store the coefficents in the "ar_model_weekly" matrix. The coefficients are updated in a rolling window=52.
+number_training_weekly<-nrow(log_return_weekly_training)
+ar_model_weekly=log_return_weekly_testing[,1:5]
+ar_model_weekly[,]=NA
+for (i in 1:nrow(ar_model_weekly)){
+  for (j in 1:(stock_number-1)){
+    ar_model_weekly[i,j]=arima(log_return_weekly[(number_training_weekly+i-1-moving_window_weekly):(number_training_weekly+i-1),j],order=c(1,0,0))$coef[1]
+  }
+}
+
+#use the coefficient to predict the log_return at the next datapoint
+log_return_weekly_ac=log_return_weekly_testing[,1:5]
+log_return_weekly_ac[,]=NA
+for (i in 1:nrow(log_return_weekly_ac)){
+  for (j in 1:(stock_number-1)){
+    log_return_weekly_ac[i,j]=as.numeric(ar_model_weekly[i,j])*as.numeric(log_return_weekly[(i+number_training_weekly-1),j])
+  }
+}
+##calcualte the weights
+weights_ac_weekly=log_return_weekly_testing[,1:5]
+weights_ac_weekly[,]=NA
+colnames(weights_ac_weekly)=paste0(stock_list[1:5],"_weight")
+
+for (i in 2:nrow(weights_ac_weekly)){
+  covariance_matrix_temp=matrix(nrow=5,ncol=5)
+  for (j in 1:5){
+    for (k in 1:5){
+      covariance_matrix_temp[j,k]=sqrt(volatility_weekly[i+number_training_weekly,j])*cor(log_return_weekly[(i+number_training_weekly-moving_window_weekly):(i+number_training_weekly),1:5])[j,k]*sqrt(volatility_weekly[i+number_training_weekly,k])
+    }
+  }
+  weights_ac_weekly[i,]=0.4-unlist(portfolio.optim(log_return_weekly_ac[i-1,1:5],shorts=TRUE,reslow=rep(-1,5),reshigh = rep(1,5),covmat=covariance_matrix_temp)[1])
+  rm(covariance_matrix_temp)
+}
+weights_ac_weekly[1,]=rep(0.2,5)
+
+####calculate total wealth at the end of each week
+capital_ac_weekly=capital_update(stock_price_weekly_testing[,1:5],weights_ac_weekly,5000)
+colnames(capital_ac_weekly)="capital_autocorrelation_weekly"
+
+
+#-----------------------
+#Rebalance: Monthly 
+#-----------------------
+##use AR(1) model to predict the return. store the coefficents in the "ar_model_monthly" matrix. The coefficients are updated in a rolling window=12.
+number_training_monthly<-nrow(log_return_monthly_training)
+ar_model_monthly=log_return_monthly_testing[,1:5]
+ar_model_monthly[,]=NA
+for (i in 1:nrow(ar_model_monthly)){
+  for (j in 1:(stock_number-1)){
+    ar_model_monthly[i,j]=arima(log_return_monthly[(number_training_monthly+i-1-moving_window_monthly):(number_training_monthly+i-1),j],order=c(1,0,0))$coef[1]
+  }
+}
+
+#use the coefficient to predict the log_return at the next datapoint
+log_return_monthly_ac=log_return_monthly_testing[,1:5]
+log_return_monthly_ac[,]=NA
+for (i in 1:nrow(log_return_monthly_ac)){
+  for (j in 1:(stock_number-1)){
+    log_return_monthly_ac[i,j]=as.numeric(ar_model_monthly[i,j])*as.numeric(log_return_monthly[(i+number_training_monthly-1),j])
+  }
+}
+##calcualte the weights
+weights_ac_monthly=log_return_monthly_testing[,1:5]
+weights_ac_monthly[,]=NA
+colnames(weights_ac_monthly)=paste0(stock_list[1:5],"_weight")
+
+for (i in 2:nrow(weights_ac_monthly)){
+  covariance_matrix_temp=matrix(nrow=5,ncol=5)
+  for (j in 1:5){
+    for (k in 1:5){
+      covariance_matrix_temp[j,k]=sqrt(volatility_monthly[i+number_training_monthly,j])*cor(log_return_monthly[(i+number_training_monthly-moving_window_monthly):(i+number_training_monthly),1:5])[j,k]*sqrt(volatility_monthly[i+number_training_monthly,k])
+    }
+  }
+  weights_ac_monthly[i,]=0.4-unlist(portfolio.optim(log_return_monthly_ac[i-1,1:5],shorts=TRUE,reslow=rep(-1,5),reshigh = rep(1,5),covmat=covariance_matrix_temp)[1])
+  rm(covariance_matrix_temp)
+}
+weights_ac_monthly[1,]=rep(0.2,5)
+
+####calculate total wealth at the end of each day
+capital_ac_monthly=capital_update(stock_price_monthly_testing[,1:5],weights_ac_monthly,5000)
+colnames(capital_ac_monthly)="capital_autocorrelation_monthly"
+
+
+######## compare the performance of dynamic portfolio and the SP500 ########
+
+# daily 
+SP500_daily<-to.weekly(portfolio_daily_testing$`S&P500_price`)[,4]*(5000/1268)
+daily_ac.comparison<-xts(cbind(SP500_daily,capital_ac_daily[,1]))
+colnames(daily_ac.comparison)<-c("S&P500","Autocorrelation Trading Strategy")
+daily.ac.plot<-ggplot(daily_ac.comparison,aes(x = index(daily_comparison)))+
+  geom_line(aes(y = daily_ac.comparison[,1], color = "S&P500"))+
+  ggtitle("Comparison Between Daily Rebalanced Autocorrelation Strategy and S&P500") +
+  geom_line(aes(y = daily_ac.comparison[,2], color = "Autocorrelation Trading Strategy")) +
+  xlab("Date") + ylab("Total Value") +
+  theme(plot.title = element_text(hjust = 0.5), panel.border = element_blank()) +
+  scale_x_date(date_labels = "%m/%y") +
+  scale_colour_manual("", values=c("S&P500"="gray40", "Autocorrelation Trading Strategy"="firebrick4"))+
+  theme(legend.position="bottom")
+
+
+# weekly
+SP500_weekly<-to.weekly(portfolio_daily_testing$`S&P500_price`)[,4]*(5000/1268)
+weekly_ac.comparison<-xts(cbind(SP500_weekly,capital_ac_weekly[,1]))
+colnames(weekly_ac.comparison)<-c("S&P500","Autocorrelation Trading Strategy")
+weekly.ac.plot<-ggplot(weekly_ac.comparison,aes(x = index(weekly_ac.comparison)))+
+  geom_line(aes(y = weekly_ac.comparison[,1], color = "S&P500"))+
+  ggtitle("Comparison Between Weekly Rebalanced Autocorrelation Strategy and S&P500") +
+  geom_line(aes(y = weekly_ac.comparison[,2], color = "Autocorrelation Trading Strategy")) +
+  xlab("Date") + ylab("Total Value") +
+  theme(plot.title = element_text(hjust = 0.5), panel.border = element_blank()) +
+  scale_x_date(date_labels = "%m/%y") +
+  scale_colour_manual("", values=c("S&P500"="gray40", "Autocorrelation Trading Strategy"="firebrick4"))+
+  theme(legend.position="bottom")
+
+# monthly
+SP500_monthly<-to.monthly(portfolio_daily_testing$`S&P500_price`)[,4]*(5000/1268)
+colnames(SP500_monthly)<-"S&P500"
+colnames(capital_ac_monthly[,1])<-"Autocorrelation Trading Strategy"
+
+monthly.ac.plot<-ggplot(SP500_monthly,aes(x = index(capital_ac_monthly)))+
+  geom_line(aes(y =SP500_monthly, color = "S&P500"))+
+  ggtitle("Comparison Between Monthly Rebalanced Autocorrelation Strategy and S&P500") +
+  geom_line(aes(y =capital_ac_monthly[,1], color = "Autocorrelation Trading Strategy")) +
+  xlab("Date") + ylab("Total Value") +
+  scale_x_date(date_labels = "%m/%y") +
+  theme(plot.title = element_text(hjust = 0.5), panel.border = element_blank()) +
+  scale_colour_manual("", values=c("S&P500"="gray40", "Autocorrelation Trading Strategy"="firebrick4"))+
+  theme(legend.position="bottom")
+
+# Compare the performance of 3 strategies with S&P500 
+
+# Daily
+daily_comparison<-xts(cbind(SP500_daily,capital_momentum_daily,capital_value_daily,capital_ac_daily[,1]))
+colnames(daily_comparison)<-c("S&P500","Momentum Strategy","Value Strategy","Dynamic Strategy")
+daily.plot.comparison<-ggplot(daily_comparison,aes(x = index(daily_comparison)))+
+  geom_line(aes(y = daily_comparison[,1], color = "S&P500"))+
+  ggtitle("Comparison Between Daily Rebalanced Strategies and S&P500") +
+  geom_line(aes(y = daily_comparison[,2], color = "Momentum Strategy")) +
+  geom_line(aes(y = daily_comparison[,3], color = "Value Strategy")) +
+  geom_line(aes(y = daily_comparison[,4], color = "Dynamic Strategy"))+
+  xlab("Date") + ylab("Total Value") +
+  theme(plot.title = element_text(hjust = 0.5), panel.border = element_blank()) +
+  scale_x_date(date_labels = "%m/%y") +
+  scale_colour_manual("", values=c("S&P500"="gray40", "Momentum Strategy"="firebrick4", "Value Strategy"="darkcyan","Dynamic Strategy"="darkblue"))+
+  theme(legend.position="bottom")
+
+# weekly
+SP500_weekly<-to.weekly(portfolio_daily_testing$`S&P500_price`)[,4]*(5000/1268)
+weekly_comparison<-xts(cbind(SP500_weekly,capital_momentum_weekly,capital_value_weekly,capital_ac_weekly))
+colnames(weekly_comparison)<-c("S&P500","Momentum Strategy","Value Strategy","Dynamic Strategy")
+weekly.plot.comparison<-ggplot(weekly_comparison,aes(x = index(weekly_comparison)))+
+  geom_line(aes(y = weekly_comparison[,1], color = "S&P500"))+
+  ggtitle("Comparison Between Weekly Rebalanced Strategies and S&P500") +
+  geom_line(aes(y = weekly_comparison[,2], color = "Momentum Strategy")) +
+  geom_line(aes(y = weekly_comparison[,3], color = "Value Strategy")) +
+  geom_line(aes(y = weekly_comparison[,4], color = "Dynamic Strategy")) +
+  xlab("Date") + ylab("Total Value") +
+  theme(plot.title = element_text(hjust = 0.5), panel.border = element_blank()) +
+  scale_x_date(date_labels = "%m/%y") +
+  scale_colour_manual("", values=c("S&P500"="gray40", "Momentum Strategy"="firebrick4", "Value Strategy"="darkcyan","Dynamic Strategy"="darkblue"))+
+  theme(legend.position="bottom")
+
+# monthly
+SP500_monthly<-to.monthly(portfolio_daily_testing$`S&P500_price`)[,4]*(5000/1268)
+colnames(SP500_monthly)<-"S&P500"
+colnames(capital_momentum_monthly[,1])<-"Momentum Strategy"
+colnames(capital_value_monthly[,1])<-"Value Strategy"
+colnames(capital_ac_monthly[,1])<-"Dynamic Strategy"
+monthly.plot.comparison<-ggplot(SP500_monthly,aes(x = index(capital_momentum_monthly)))+
+  geom_line(aes(y =SP500_monthly, color = "S&P500"))+
+  ggtitle("Comparison Between Monthly Rebalanced Strategies and S&P500") +
+  geom_line(aes(y =capital_momentum_monthly[,1], color = "Momentum Strategy")) +
+  geom_line(aes(y = capital_value_monthly[,1], color = "Value Strategy")) +
+  geom_line(aes(y = capital_ac_monthly[,1], color = "Dynamic Strategy")) +
+  xlab("Date") + ylab("Total Value") +
+  scale_x_date(date_labels = "%m/%y") +
+  theme(plot.title = element_text(hjust = 0.5), panel.border = element_blank()) +
+  scale_colour_manual("", values=c("S&P500"="gray40", "Momentum Strategy"="firebrick4", "Value Strategy"="darkcyan","Dynamic Strategy"="darkblue"))+
+  theme(legend.position="bottom")
+
+#-------------------------------------------
+#99% VaR and 97.5% ES for part (b) and (c)
+#------------------------------------------
+
+############## Daily:ES and VaR of Value strategy for normal and historical model ################
+
+#  Normal model
+
+capital.Value_lastday_daily<-capital_value_daily[nrow(capital_value_daily),]
+loss_return_daily.value.strategy<--diff(log(capital_value_daily))[-1,]
+mu.return.daily<-mean(as.numeric(loss_return_daily.value.strategy))
+variance.return_daily<-var(as.numeric(loss_return_daily.value.strategy))
+VaR.return_daily.normal<- mu.return.daily + sqrt(variance.return_daily) * qnorm(0.99)
+VaR.return_value.normal.nonlinear.daily=capital.Value_lastday_daily*(1-exp(-VaR.return_daily.normal))
+VaR.return_value.normal.linear.daily=capital.Value_lastday_daily*VaR.return_daily.normal
+ES.return_daily.normal<- mu.return.daily + sqrt(variance.return_daily) * dnorm(qnorm(0.975))/(1-0.975)
+ES.return_daily.normal.nonlinear=capital.Value_lastday_daily*(1-exp(-ES.return_daily.normal))
+ES.return_daily.normal.linear=capital.Value_lastday_daily*ES.return_daily.normal
+
+#  Historical simulation
+
+# non-linear
+his_return_daily.value<-1-exp(-loss_return_daily.value.strategy)
+VaR.hs.daily_value.nonlinear <- quantile(his_return_daily.value,0.99)*capital.Value_lastday_daily
+VaR.hs.daily_value_0.975 <- quantile(his_return_daily.value,0.975)
+ES.hs.daily_value.nonlinear <- mean(his_return_daily.value[his_return_daily.value > VaR.hs.daily_value_0.975])*capital.Value_lastday_daily
+# linear
+VaR.hs.daily_value.linear <- quantile(loss_return_daily.value.strategy,0.99)*capital.Value_lastday_daily
+VaR.hs.daily_value_0.975 <- quantile(loss_return_daily.value.strategy,0.975)
+ES.hs.daily_value.linear <- mean(loss_return_daily.value.strategy[loss_return_daily.value.strategy > VaR.hs.daily_value_0.975])*capital.Value_lastday_daily
+
+
+############## Weekly:ES and VaR of Value strategy for normal and historical model ################
+#  Normal model
+capital.Value_lastday_weekly<-capital_value_weekly[nrow(capital_value_weekly),]
+loss_return_weekly.value.strategy<--diff(log(capital_value_weekly))[-1,]
+mu.return.weekly<-mean(as.numeric(loss_return_weekly.value.strategy))
+variance.return_weekly<-var(as.numeric(loss_return_weekly.value.strategy))
+VaR.return_weekly.normal<- mu.return.weekly + sqrt(variance.return_weekly) * qnorm(0.99)
+VaR.return_value.normal.nonlinear=capital.Value_lastday_weekly*(1-exp(-VaR.return_weekly.normal))
+VaR.return_value.normal.linear=capital.Value_lastday_weekly*VaR.return_weekly.normal
+ES.return_weekly.normal<- mu.return.weekly + sqrt(variance.return_weekly) * dnorm(qnorm(0.975))/(1-0.975)
+ES.return_weekly.normal.nonlinear=capital.Value_lastday_weekly*(1-exp(-ES.return_weekly.normal))
+ES.return_weekly.normal.linear=capital.Value_lastday_weekly*ES.return_weekly.normal
+
+#  Historical simulation
+
+# non-linear
+his_return_weekly.value<-1-exp(-loss_return_weekly.value.strategy)
+VaR.hs.weekly_value.nonlinear <- quantile(his_return_weekly.value,0.99)*capital.Value_lastday_weekly
+VaR.hs.weekly_value_0.975 <- quantile(his_return_weekly.value,0.975)
+ES.hs.weekly_value.nonlinear <- mean(his_return_weekly.value[his_return_weekly.value > VaR.hs.weekly_value_0.975])*capital.Value_lastday_weekly
+qqnorm(loss_return_weekly.value.strategy,main = "QQ-plot for Log Return of Weekly Rebalanced Value Strategy")
+qqline(loss_return_weekly.value.strategy)
+# linear
+VaR.hs.weekly_value.linear <- quantile(loss_return_weekly.value.strategy,0.99)*capital.Value_lastday_weekly
+VaR.hs.weekly_value_0.975 <- quantile(loss_return_weekly.value.strategy,0.975)
+ES.hs.weekly_value.linear <- mean(loss_return_weekly.value.strategy[loss_return_weekly.value.strategy > VaR.hs.weekly_value_0.975])*capital.Value_lastday_weekly
+
+# plot value strategy results for weekly rebalance (non-linear)
+hist(loss_return_weekly.value.strategy,nclass=100, prob=TRUE, xlab="Log Return for Weekly Rebalance Value Strategy",
+     main="Value Strategy with Weekly Rebalance")
+lines(seq(-0.15,0.15,by=1/100), dnorm(seq(-0.15,0.15, by=1/100),mu.return.weekly, sqrt(variance.return_weekly)), col="blue")
+abline(v=c(VaR.return_value.normal.nonlinear/capital.Value_lastday_weekly,ES.return_weekly.normal.nonlinear/capital.Value_lastday_weekly),col=c("blue"),lty=c(1,2))
+text(x=0.065,y=12,label="99% log return VaR",col="blue",cex=0.7)
+text(x=0.12,y=11,label="97.5% log return ES",col="blue",cex=0.7)
+lines(density(loss_return_weekly.value.strategy), col="red")
+abline(v=c(VaR.hs.weekly_value.nonlinear/capital.Value_lastday_weekly,ES.hs.weekly_value.nonlinear/capital.Value_lastday_weekly),col=c("red"),lty=c(1,2))
+text(x=0.075,y=10,label="97.5% log return ES",col="red",cex=0.7)
+text(x=0.135,y=9,label="99% log return VaR",col="red",cex=0.7)
+
+legendnames <- c("Normal: 99% log return VaR and 97.5% log return ES","Historical Simulation: 99% log return VaR and 97.5% log return ES")
+legend("topleft", legend = legendnames, col=c("blue","red"), pch="-",cex = 0.63) 
+
+############## Monthly:ES and VaR of Value strategy for normal and historical model ################
+
+#  Normal model
+
+capital.Value_lastday_monthly<-capital_value_monthly[nrow(capital_value_monthly),]
+loss_return_monthly.value.strategy<--diff(log(capital_value_monthly))[-1,]
+mu.return.monthly<-mean(as.numeric(loss_return_monthly.value.strategy))
+variance.return_monthly<-var(as.numeric(loss_return_monthly.value.strategy))
+VaR.return_monthly.normal<- mu.return.monthly + sqrt(variance.return_monthly) * qnorm(0.99)
+VaR.return_value.normal.nonlinear.monthly=capital.Value_lastday_monthly*(1-exp(-VaR.return_monthly.normal))
+VaR.return_value.normal.linear.monthly=capital.Value_lastday_monthly*VaR.return_monthly.normal
+ES.return_monthly.normal<- mu.return.monthly + sqrt(variance.return_monthly) * dnorm(qnorm(0.975))/(1-0.975)
+ES.return_monthly.normal.nonlinear=capital.Value_lastday_monthly*(1-exp(-ES.return_monthly.normal))
+ES.return_monthly.normal.linear=capital.Value_lastday_monthly*ES.return_monthly.normal
+
+#  Historical simulation
+
+# non-linear
+his_return_monthly.value<-1-exp(-loss_return_monthly.value.strategy)
+VaR.hs.monthly_value.nonlinear <- quantile(his_return_monthly.value,0.99)*capital.Value_lastday_monthly
+VaR.hs.monthly_value_0.975 <- quantile(his_return_monthly.value,0.975)
+ES.hs.monthly_value.nonlinear <- mean(his_return_monthly.value[his_return_monthly.value > VaR.hs.monthly_value_0.975])*capital.Value_lastday_monthly
+# linear
+VaR.hs.monthly_value.linear <- quantile(loss_return_monthly.value.strategy,0.99)*capital.Value_lastday_monthly
+VaR.hs.monthly_value_0.975 <- quantile(loss_return_monthly.value.strategy,0.975)
+ES.hs.monthly_value.linear <- mean(loss_return_monthly.value.strategy[loss_return_monthly.value.strategy > VaR.hs.monthly_value_0.975])*capital.Value_lastday_monthly
+
+
+############## Daily:ES and VaR of momentum strategy for normal and historical model ################
+#  Normal model
+capital.momentum_lastday_daily<-capital_momentum_daily[nrow(capital_momentum_daily),]
+loss_return_daily.momentum.strategy<--diff(log(capital_momentum_daily))[-1,]
+mu.return.daily.momentum<-mean(as.numeric(loss_return_daily.momentum.strategy))
+variance.return_daily.momentum<-var(as.numeric(loss_return_daily.momentum.strategy))
+VaR.return_daily.normal.momentum<- mu.return.daily.momentum + sqrt(variance.return_daily.momentum) * qnorm(0.99)
+VaR.return_daily.normal.momentum.nonlinear=capital.momentum_lastday_daily*(1-exp(-VaR.return_daily.normal.momentum))
+VaR.return_momentum.daily.normal.linear=capital.momentum_lastday_daily*VaR.return_daily.normal.momentum
+ES.return_daily.momentum.normal<- mu.return.daily.momentum + sqrt(variance.return_daily.momentum) * dnorm(qnorm(0.975))/(1-0.975)
+ES.return_daily.momentum.normal.nonlinear=capital.momentum_lastday_daily*(1-exp(-ES.return_daily.momentum.normal))
+ES.return_daily.momentum.normal.linear=capital.momentum_lastday_daily*ES.return_daily.momentum.normal
+
+#  Historical simulation
+
+# non-linear
+his_return_daily.momentum<-1-exp(-loss_return_daily.momentum.strategy)
+VaR.hs.daily_momentum.nonlinear <- quantile(his_return_daily.momentum,0.99)*capital.momentum_lastday_daily
+VaR.hs.daily_momentum_0.975 <- quantile(his_return_daily.momentum,0.975)
+ES.hs.daily_momentum.nonlinear <- mean(his_return_daily.momentum[his_return_daily.momentum > VaR.hs.daily_momentum_0.975])*capital.momentum_lastday_daily
+
+# linear
+VaR.hs.daily_momentum.linear <- quantile(loss_return_daily.momentum.strategy,0.99)*capital.momentum_lastday_daily
+VaR.hs.daily_momentum_0.975 <- quantile(loss_return_daily.momentum.strategy,0.975)
+ES.hs.daily_momentum.linear <- mean(loss_return_daily.momentum.strategy[loss_return_daily.momentum.strategy > VaR.hs.daily_momentum_0.975])*capital.momentum_lastday_daily
+
+############## Weekly:ES and VaR of momentum strategy for normal and historical model ################
+#  Normal model
+capital.momentum_lastday_weekly<-capital_momentum_weekly[nrow(capital_momentum_weekly),]
+loss_return_weekly.momentum.strategy<--diff(log(capital_momentum_weekly))[-1,]
+mu.return.weekly.momentum<-mean(as.numeric(loss_return_weekly.momentum.strategy))
+variance.return_weekly.momentum<-var(as.numeric(loss_return_weekly.momentum.strategy))
+VaR.return_weekly.normal.momentum<- mu.return.weekly.momentum + sqrt(variance.return_weekly.momentum) * qnorm(0.99)
+VaR.return_weekly.normal.momentum.nonlinear=capital.momentum_lastday_weekly*(1-exp(-VaR.return_weekly.normal.momentum))
+VaR.return_momentum.weekly.normal.linear=capital.momentum_lastday_weekly*VaR.return_weekly.normal.momentum
+ES.return_weekly.momentum.normal<- mu.return.weekly.momentum + sqrt(variance.return_weekly.momentum) * dnorm(qnorm(0.975))/(1-0.975)
+ES.return_weekly.momentum.normal.nonlinear=capital.momentum_lastday_weekly*(1-exp(-ES.return_weekly.momentum.normal))
+ES.return_weekly.momentum.normal.linear=capital.momentum_lastday_weekly*ES.return_weekly.momentum.normal
+
+#  Historical simulation
+
+# non-linear
+his_return_weekly.momentum<-1-exp(-loss_return_weekly.momentum.strategy)
+VaR.hs.weekly_momentum.nonlinear <- quantile(his_return_weekly.momentum,0.99)*capital.momentum_lastday_weekly
+VaR.hs.weekly_momentum_0.975 <- quantile(his_return_weekly.momentum,0.975)
+ES.hs.weekly_momentum.nonlinear <- mean(his_return_weekly.momentum[his_return_weekly.momentum > VaR.hs.weekly_momentum_0.975])*capital.momentum_lastday_weekly
+
+qqnorm(loss_return_weekly.momentum.strategy,main = "QQ-plot for Log Return of Weekly Rebalanced Momentum Strategy")
+qqline(loss_return_weekly.momentum.strategy)
+# linear
+VaR.hs.weekly_momentum.linear <- quantile(loss_return_weekly.momentum.strategy,0.99)*capital.momentum_lastday_weekly
+VaR.hs.weekly_momentum_0.975 <- quantile(loss_return_weekly.momentum.strategy,0.975)
+ES.hs.weekly_momentum.linear <- mean(loss_return_weekly.momentum.strategy[loss_return_weekly.momentum.strategy > VaR.hs.weekly_momentum_0.975])*capital.momentum_lastday_weekly
+
+# test normality
+
+MardiaTest(as.timeSeries(log_return_weekly_testing[,1:5]))
+
+# plot value strategy results for weekly rebalance (non-linear)
+hist(loss_return_weekly.momentum.strategy,nclass=100, prob=TRUE, xlab="Log Return for Weekly Rebalance Momentum Strategy",
+     main="Momentum Strategy with Weekly Rebalance")
+lines(seq(-0.15,0.15,by=1/100), dnorm(seq(-0.15,0.15, by=1/100),mu.return.weekly.momentum, sqrt(variance.return_weekly.momentum)), col="blue")
+abline(v=c(VaR.return_weekly.normal.momentum.nonlinear/capital.momentum_lastday_weekly,ES.return_weekly.momentum.normal.nonlinear/capital.momentum_lastday_weekly),col=c("blue"),lty=c(1,2))
+text(x=0.052,y=15,label="99% log return VaR",col="blue",cex=0.7)
+text(x=0.1,y=14,label="97.5% log return ES",col="blue",cex=0.7)
+lines(density(loss_return_weekly.momentum.strategy), col="red")
+abline(v=c(VaR.hs.weekly_momentum.nonlinear/capital.momentum_lastday_weekly,ES.hs.weekly_momentum.nonlinear/capital.momentum_lastday_weekly),col=c("red"),lty=c(1,2))
+text(x=0.065,y=13,label="99% log return VaR",col="red",cex=0.7)
+text(x=0.112,y=12,label="97.5% log return ES",col="red",cex=0.7)
+legendnames <- c("Normal: 99% log return VaR and 97.5% log return ES","Historical Simulation: 99% log return VaR and 97.5% log return ES")
+legend("topleft", legend = legendnames, col=c("blue","red"), pch="-",cex = 0.65) 
+
+
+############## Monthly:ES and VaR of momentum strategy for normal and historical model ################
+#  Normal model
+capital.momentum_lastday_monthly<-capital_momentum_monthly[nrow(capital_momentum_monthly),]
+loss_return_monthly.momentum.strategy<--diff(log(capital_momentum_monthly))[-1,]
+mu.return.monthly.momentum<-mean(as.numeric(loss_return_monthly.momentum.strategy))
+variance.return_monthly.momentum<-var(as.numeric(loss_return_monthly.momentum.strategy))
+VaR.return_monthly.normal.momentum<- mu.return.monthly.momentum + sqrt(variance.return_monthly.momentum) * qnorm(0.99)
+VaR.return_monthly.normal.momentum.nonlinear=capital.momentum_lastday_monthly*(1-exp(-VaR.return_monthly.normal.momentum))
+VaR.return_momentum.monthly.normal.linear=capital.momentum_lastday_monthly*VaR.return_monthly.normal.momentum
+ES.return_monthly.momentum.normal<- mu.return.monthly.momentum + sqrt(variance.return_monthly.momentum) * dnorm(qnorm(0.975))/(1-0.975)
+ES.return_monthly.momentum.normal.nonlinear=capital.momentum_lastday_monthly*(1-exp(-ES.return_monthly.momentum.normal))
+ES.return_monthly.momentum.normal.linear=capital.momentum_lastday_monthly*ES.return_monthly.momentum.normal
+
+#  Historical simulation
+
+# non-linear
+his_return_monthly.momentum<-1-exp(-loss_return_monthly.momentum.strategy)
+VaR.hs.monthly_momentum.nonlinear <- quantile(his_return_monthly.momentum,0.99)*capital.momentum_lastday_monthly
+VaR.hs.monthly_momentum_0.975 <- quantile(his_return_monthly.momentum,0.975)
+ES.hs.monthly_momentum.nonlinear <- mean(his_return_monthly.momentum[his_return_monthly.momentum > VaR.hs.monthly_momentum_0.975])*capital.momentum_lastday_monthly
+
+# linear
+VaR.hs.monthly_momentum.linear <- quantile(loss_return_monthly.momentum.strategy,0.99)*capital.momentum_lastday_monthly
+VaR.hs.monthly_momentum_0.975 <- quantile(loss_return_monthly.momentum.strategy,0.975)
+ES.hs.monthly_momentum.linear <- mean(loss_return_monthly.momentum.strategy[loss_return_monthly.momentum.strategy > VaR.hs.monthly_momentum_0.975])*capital.momentum_lastday_monthly
+
+
+############## Daily:ES and VaR of dynamic strategy for normal and historical model ################
+#  Normal model
+capital.auto_lastday_daily<-capital_ac_daily[nrow(capital_ac_daily),]
+loss_return_daily.auto.strategy<--diff(log(capital_ac_daily))[-1,]
+mu.return.daily.auto<-mean(as.numeric(loss_return_daily.auto.strategy))
+variance.return_daily.auto<-var(as.numeric(loss_return_daily.auto.strategy))
+VaR.return_daily.normal.auto<- mu.return.daily.auto + sqrt(variance.return_daily.auto) * qnorm(0.99)
+VaR.return_daily.normal.auto.nonlinear=capital.auto_lastday_daily*(1-exp(-VaR.return_daily.normal.auto))
+VaR.return_auto.daily.normal.linear=capital.auto_lastday_daily*VaR.return_daily.normal.auto
+ES.return_daily.auto.normal<- mu.return.daily.auto + sqrt(variance.return_daily.auto) * dnorm(qnorm(0.975))/(1-0.975)
+ES.return_daily.auto.normal.nonlinear=capital.auto_lastday_daily*(1-exp(-ES.return_daily.auto.normal))
+ES.return_daily.auto.normal.linear=capital.auto_lastday_daily*ES.return_daily.auto.normal
+
+#  Historical simulation
+
+# non-linear
+his_return_daily.auto<-1-exp(-loss_return_daily.auto.strategy)
+VaR.hs.daily_auto.nonlinear <- quantile(his_return_daily.auto,0.99)*capital.auto_lastday_daily
+VaR.hs.daily_auto_0.975 <- quantile(his_return_daily.auto,0.975)
+ES.hs.daily_auto.nonlinear <- mean(his_return_daily.auto[his_return_daily.auto > VaR.hs.daily_auto_0.975])*capital.auto_lastday_daily
+
+# linear
+VaR.hs.daily_auto.linear <- quantile(loss_return_daily.auto.strategy,0.99)*capital.auto_lastday_daily
+VaR.hs.daily_auto_0.975 <- quantile(loss_return_daily.auto.strategy,0.975)
+ES.hs.daily_auto.linear <- mean(loss_return_daily.auto.strategy[loss_return_daily.auto.strategy > VaR.hs.daily_auto_0.975])*capital.auto_lastday_daily
+
+############## Weekly:ES and VaR of dynamic strategy for normal and historical model ################
+#  Normal model
+capital.auto_lastday_weekly<-capital_ac_weekly[nrow(capital_ac_weekly),]
+loss_return_weekly.auto.strategy<--diff(log(capital_ac_weekly))[-1,]
+mu.return.weekly.auto<-mean(as.numeric(loss_return_weekly.auto.strategy))
+variance.return_weekly.auto<-var(as.numeric(loss_return_weekly.auto.strategy))
+VaR.return_weekly.normal.auto<- mu.return.weekly.auto + sqrt(variance.return_weekly.auto) * qnorm(0.99)
+VaR.return_weekly.normal.auto.nonlinear=capital.auto_lastday_weekly*(1-exp(-VaR.return_weekly.normal.auto))
+VaR.return_auto.weekly.normal.linear=capital.auto_lastday_weekly*VaR.return_weekly.normal.auto
+ES.return_weekly.auto.normal<- mu.return.weekly.auto + sqrt(variance.return_weekly.auto) * dnorm(qnorm(0.975))/(1-0.975)
+ES.return_weekly.auto.normal.nonlinear=capital.auto_lastday_weekly*(1-exp(-ES.return_weekly.auto.normal))
+ES.return_weekly.auto.normal.linear=capital.auto_lastday_weekly*ES.return_weekly.auto.normal
+
+#  Historical simulation
+
+# non-linear
+his_return_weekly.auto<-1-exp(-loss_return_weekly.auto.strategy)
+VaR.hs.weekly_auto.nonlinear <- quantile(his_return_weekly.auto,0.99)*capital.auto_lastday_weekly
+VaR.hs.weekly_auto_0.975 <- quantile(his_return_weekly.auto,0.975)
+ES.hs.weekly_auto.nonlinear <- mean(his_return_weekly.auto[his_return_weekly.auto > VaR.hs.weekly_auto_0.975])*capital.auto_lastday_weekly
+qqnorm(loss_return_weekly.auto.strategy,main = "QQ-plot for Log Return of Weekly Rebalanced Dynamic Strategy")
+qqline(loss_return_weekly.auto.strategy)
+
+# linear
+VaR.hs.weekly_auto.linear <- quantile(loss_return_weekly.auto.strategy,0.99)*capital.auto_lastday_weekly
+VaR.hs.weekly_auto_0.975 <- quantile(loss_return_weekly.auto.strategy,0.975)
+ES.hs.weekly_auto.linear <- mean(loss_return_weekly.auto.strategy[loss_return_weekly.auto.strategy > VaR.hs.weekly_auto_0.975])*capital.auto_lastday_weekly
+
+# plot value strategy results for weekly rebalance (non-linear)
+hist(loss_return_weekly.auto.strategy,nclass=100, prob=TRUE, xlab="Log Return for Weekly Rebalance Dynamic Strategy",
+     main="Dynamic Strategy with Weekly Rebalance",xlim = c(-0.2,0.2))
+lines(seq(-0.2,0.2,by=1/100), dnorm(seq(-0.2,0.2, by=1/100),mu.return.weekly.auto, sqrt(variance.return_weekly.auto)), col="blue")
+abline(v=c(VaR.return_weekly.normal.auto.nonlinear/capital.auto_lastday_weekly,ES.return_weekly.auto.normal.nonlinear/capital.auto_lastday_weekly),col=c("blue"),lty=c(1,2))
+text(x=0.06,y=14,label="99% log return VaR",col="blue",cex=0.7)
+text(x=0.13,y=12,label="97.5% log return ES",col="blue",cex=0.7)
+lines(density(loss_return_weekly.auto.strategy), col="red")
+abline(v=c(VaR.hs.weekly_auto.nonlinear/capital.auto_lastday_weekly,ES.hs.weekly_auto.nonlinear/capital.auto_lastday_weekly),col=c("red"),lty=c(1,2))
+text(x=0.07,y=10,label="99% log return VaR",col="red",cex=0.7)
+text(x=0.14,y=8,label="97.5% log return ES",col="red",cex=0.7)
+legendnames <- c("Normal: 99% log return VaR and 97.5% log return ES","Historical Simulation: 99% log return VaR and 97.5% log return ES")
+legend("topleft", legend = legendnames, col=c("blue","red"), pch="-",cex = 0.65) 
+
+############## Monthly:ES and VaR of dynamic strategy for normal and historical model ################
+#  Normal model
+capital.auto_lastday_monthly<-capital_ac_monthly[nrow(capital_ac_monthly),]
+loss_return_monthly.auto.strategy<--diff(log(capital_ac_monthly))[-1,]
+mu.return.monthly.auto<-mean(as.numeric(loss_return_monthly.auto.strategy))
+variance.return_monthly.auto<-var(as.numeric(loss_return_monthly.auto.strategy))
+VaR.return_monthly.normal.auto<- mu.return.monthly.auto + sqrt(variance.return_monthly.auto) * qnorm(0.99)
+VaR.return_monthly.normal.auto.nonlinear=capital.auto_lastday_monthly*(1-exp(-VaR.return_monthly.normal.auto))
+VaR.return_auto.monthly.normal.linear=capital.auto_lastday_monthly*VaR.return_monthly.normal.auto
+ES.return_monthly.auto.normal<- mu.return.monthly.auto + sqrt(variance.return_monthly.auto) * dnorm(qnorm(0.975))/(1-0.975)
+ES.return_monthly.auto.normal.nonlinear=capital.auto_lastday_monthly*(1-exp(-ES.return_monthly.auto.normal))
+ES.return_monthly.auto.normal.linear=capital.auto_lastday_monthly*ES.return_monthly.auto.normal
+
+#  Historical simulation
+
+# non-linear
+his_return_monthly.auto<-1-exp(-loss_return_monthly.auto.strategy)
+VaR.hs.monthly_auto.nonlinear <- quantile(his_return_monthly.auto,0.99)*capital.auto_lastday_monthly
+VaR.hs.monthly_auto_0.975 <- quantile(his_return_monthly.auto,0.975)
+ES.hs.monthly_auto.nonlinear <- mean(his_return_monthly.auto[his_return_monthly.auto > VaR.hs.monthly_auto_0.975])*capital.auto_lastday_monthly
+
+# linear
+VaR.hs.monthly_auto.linear <- quantile(loss_return_monthly.auto.strategy,0.99)*capital.auto_lastday_monthly
+VaR.hs.monthly_auto_0.975 <- quantile(loss_return_monthly.auto.strategy,0.975)
+ES.hs.monthly_auto.linear <- mean(loss_return_monthly.auto.strategy[loss_return_monthly.auto.strategy > VaR.hs.monthly_auto_0.975])*capital.auto_lastday_monthly
+
+#--------------------
+#some other plots
+#--------------------
+#plot the ar coefficients for each stocks
+
+#daily
+par(mfrow=c(1,1),oma=rep(0,4))
+plot(ar_model_daily[,1],xlab="Dates",ylab="AR(1) Model Coefficients", ylim=c(min(ar_model_daily),max(ar_model_daily)),type="n",main="Coefficients of AR(1) Model for Tech Stocks",sub="Rebalance Period = 1 Day")
+for (i in 1:(stock_number-1)){
+  lines(ar_model_daily[,i],col=i)
+}
+legend("topright",legend=stock_list[1:5],col=1:5, lty=1,cex=0.8)
+abline(h=0)
+
+#weekly
+par(mfrow=c(1,1),oma=rep(0,4))
+plot(ar_model_weekly[,1],xlab="Dates",ylab="AR(1) Model Coefficients", ylim=c(min(ar_model_weekly),max(ar_model_weekly)),type="n",main="Coefficients of AR(1) Model for Tech Stocks",sub="Rebalance Period = 1 Week")
+for (i in 1:(stock_number-1)){
+  lines(ar_model_weekly[,i],col=i)
+}
+legend("topright",legend=stock_list[1:5],col=1:5, lty=1,cex=0.8)
+abline(h=0)
+
+#monthly
+par(mfrow=c(1,1),oma=rep(0,4))
+plot(ar_model_monthly[,1],xlab="Dates",ylab="AR(1) Model Coefficients", ylim=c(min(ar_model_monthly),max(ar_model_monthly)),type="n",main="Coefficients of AR(1) Model for Tech Stocks",sub="Rebalance Period = 1 Month")
+for (i in 1:(stock_number-1)){
+  lines(ar_model_weekly[,i],col=i)
+}
+legend("topright",legend=stock_list[1:5],col=1:5, lty=1,cex=0.8)
+abline(h=0)
+
+
+#plot the weight
+####daily####
+#momentum
+par(mfrow=c(3,1),oma=c(0,0,2,0))
+
+plot(weights_momentum_daily[,1],xlab="Dates",ylab="Weights",ylim=c(min(weights_momentum_daily),max(weights_momentum_daily)),type="n",main="Momentum Strategy")
+for ( i in 1:(stock_number-1)){
+  lines (weights_momentum_daily[,i],col=i)
+}
+abline(h=0)
+#value
+plot(weights_value_daily[,1],xlab="Dates",ylab="Weights",ylim=c(min(weights_value_daily),max(weights_value_daily)),type="n",main="Value Strategy")
+for ( i in 1:(stock_number-1)){
+  lines (weights_value_daily[,i],col=i)
+}
+abline(h=0)
+
+#autoregression
+plot(weights_ac_daily[,1],xlab="Dates",ylab="Weights",ylim=c(min(weights_ac_daily),max(weights_ac_daily)),type="n",main="Autoregression Strategy")
+for ( i in 1:(stock_number-1)){
+  lines (weights_ac_daily[,i],col=i)
+}
+abline(h=0)
+par(xpd=NA)
+
+legend("bottom",legend=stock_list[1:5],col=1:5,lty=1,cex=0.8,horiz = TRUE)
+mtext(side=3,line=0,cex=1.5,outer=T, "Weights of Each Stock in Different Strategies,Rebalance Period: 1 Day")
+
+####weekly####
+#momentum
+par(mfrow=c(3,1),oma=c(0,0,2,0))
+
+plot(weights_momentum_weekly[,1],xlab="Dates",ylab="Weights",ylim=c(min(weights_momentum_weekly),max(weights_momentum_weekly)),type="n",main="Momentum Strategy")
+for ( i in 1:(stock_number-1)){
+  lines (weights_momentum_weekly[,i],col=i)
+}
+abline(h=0)
+#value
+plot(weights_value_weekly[,1],xlab="Dates",ylab="Weights",ylim=c(min(weights_value_weekly),max(weights_value_weekly)),type="n",main="Value Strategy")
+for ( i in 1:(stock_number-1)){
+  lines (weights_value_weekly[,i],col=i)
+}
+abline(h=0)
+
+#autoregression
+plot(weights_ac_weekly[,1],xlab="Dates",ylab="Weights",ylim=c(min(weights_ac_weekly),max(weights_ac_weekly)),type="n",main="Autoregression Strategy")
+for ( i in 1:(stock_number-1)){
+  lines (weights_ac_weekly[,i],col=i)
+}
+abline(h=0)
+par(xpd=NA)
+
+legend("bottom",legend=stock_list[1:5],col=1:5,lty=1,cex=0.8,horiz = TRUE)
+mtext(side=3,line=0,cex=1.5,outer=T, "Weights of Each Stock in Different Strategies, Rebalance Period: 1 Week")
+
+
+####monthly####
+#momentum
+par(mfrow=c(3,1),oma=c(0,0,2,0))
+
+plot(weights_momentum_monthly[,1],xlab="Dates",ylab="Weights",ylim=c(min(weights_momentum_monthly),max(weights_momentum_monthly)),type="n",main="Momentum Strategy")
+for ( i in 1:(stock_number-1)){
+  lines (weights_momentum_monthly[,i],col=i)
+}
+abline(h=0)
+#value
+plot(weights_value_monthly[,1],xlab="Dates",ylab="Weights",ylim=c(min(weights_value_monthly),max(weights_value_monthly)),type="n",main="Value Strategy")
+for ( i in 1:(stock_number-1)){
+  lines (weights_value_monthly[,i],col=i)
+}
+abline(h=0)
+
+#autoregression
+plot(weights_ac_monthly[,1],xlab="Dates",ylab="Weights",ylim=c(min(weights_ac_monthly),max(weights_ac_monthly)),type="n",main="Autoregression Strategy")
+for ( i in 1:(stock_number-1)){
+  lines (weights_ac_monthly[,i],col=i)
+}
+abline(h=0)
+par(xpd=NA)
+
+legend("bottom",legend=stock_list[1:5],col=1:5,lty=1,cex=0.8,horiz = TRUE)
+mtext(side=3,line=0,cex=1.5,outer=T, "Weights of Each Stock in Different Strategies, Rebance Period: 1 Month")
+
+
+##### Compare the value of portfolio (daily,weekly,monthly)
+par(mfrow=c(3,1),oma=c(0,0,2,0))
+# Value strategy:
+plot(as.timeSeries(capital_value_daily),type="l",ylab="Value of Portfolio",col=1,ylim=c(min(capital_value_weekly),max(capital_value_weekly)))
+title("Value Strategy")
+lines(as.timeSeries(capital_value_weekly),type="l",col=2)
+lines(as.timeSeries(capital_value_monthly),type="l",col=4)
+legend("topleft", legend = c("daily","weekly","monthly"), col=c(1,2,4), lty=1) 
+
+# Momentum strategy:
+plot(as.timeSeries(capital_momentum_daily),type="l",ylab="Value of Portfolio",col=1,ylim=c(min(capital_momentum_monthly),max(capital_momentum_monthly)))
+title("Momentum Strategy")
+lines(as.timeSeries(capital_momentum_weekly),type="l",col=2)
+lines(as.timeSeries(capital_momentum_monthly),type="l",col=4)
+legend("topleft", legend = c("daily","weekly","monthly"), col=c(1,2,4), lty=1) 
+
+# Autocorrelation strategy:
+plot(as.timeSeries(capital_ac_daily),type="l",ylab="Value of Portfolio",col=1,ylim=c(min(capital_ac_weekly),max(capital_ac_weekly)))
+title("Autocorelation Strategy")
+lines(as.timeSeries(capital_ac_weekly),type="l",col=2)
+lines(as.timeSeries(capital_ac_monthly),type="l",col=4)
+legend("topleft", legend = c("daily","weekly","monthly"), col=c(1,2,4), lty=1) 
+
+mtext(side=3,line=0,cex=1.5,outer=T, "Total Value of Portfolios with Different Rebalance Period")
+
+
+
+#==================
+#part d
+#==================
+stockIndexLogReturn.ts <-timeSeries(log_return[-1,])
+names(stockIndexLogReturn.ts)=paste0(stock_list)
+#create index
+mini_index=stockIndexLogReturn.ts$AAPL*0.2423+stockIndexLogReturn.ts$AMZN*0.2314+stockIndexLogReturn.ts$GOOG*0.2376+stockIndexLogReturn.ts$MSFT*0.2529+stockIndexLogReturn.ts$NFLX*0.0359
+mini_index=timeSeries(mini_index,as.Date(portfolio$Date[-1], format="%d/%m/%Y"))
+names(mini_index)="mini_index"
+stockIndexLogReturn.ts=merge(stockIndexLogReturn.ts,mini_index)
+plot(stockIndexLogReturn.ts,col="black",main="Log return of mini index compared with other stocks")#show the independence
+par(mfrow=c(1,1))
+X <- as.matrix(stockIndexLogReturn.ts)
+X <- X[X[,6]!=0 & X[,7] !=0,c(6,7)]
+copulaX <- apply(X,2,edf,adjust=1)
+plot(copulaX, xlab="S&P 500", ylab="Mini Index",main="Copulas of Mini Index versus S&P500")
+
+# Gaussian copula fit
+copulaXGauss <- fit.gausscopula(copulaX)
+copulaXGauss
+# t copula
+copulaXt <- fit.tcopula(copulaX)
+copulaXt
+# 2-dimensional Archimedian copulas (Gumbel and Clayton)
+copulaXGumb <- fit.AC(copulaX,"gumbel")
+copulaXGumb
+copulaXClay <- fit.AC(copulaX,"clayton")
+copulaXClay
+
+c(copulaXGauss$ll.max, copulaXt$ll.max, copulaXGumb$ll.max, copulaXClay$ll.max)
+##t is the best
+
+# Estimate Spearman rank correlations
+copulacorr <- Spearman(copulaX)
+copulacorr #show the independence
+
+#================
+#part e
+#================
+Y=-mini_index#negative return
+#find large drowdown
+plot(Y,type="l", ylab="Mini Index", xlab="Date",main="Loss Return of Mini Index") 
+
+#large drowdown in 2006,2018
+#large up and down value about +/-10% on several days
+
+# Find monthly and quarterly maxima
+by <- timeSequence(from = start(Y),  to = end(Y), by = "month")
+Y.monthMax <- aggregate(Y,by,max)#max negative log-return in a month
+by <- timeSequence(from = start(Y),  to = end(Y), by = "quarter")
+Y.quarterMax <- aggregate(Y,by,max)
+
+#~ Transform to matrix and fit generalized extreme value (GEV) distribution
+Y.monthMax <- as.matrix(Y.monthMax)
+GEVmonth <- fit.GEV(Y.monthMax)#fit GEM distribution
+Y.quarterMax <- as.matrix(Y.quarterMax)
+GEVquart <- fit.GEV(Y.quarterMax)
+
+#40-quarter return level-10 years
+quarterReturn <- qGEV(1-1/40,xi=GEVquart$par.ests[1],mu=GEVquart$par.ests[2], sigma=GEVquart$par.ests[3])
+
+#return period
+1/(1-pGEV(max(Y.quarterMax),
+          xi=GEVquart$par.ests[1],mu=GEVquart$par.ests[3],sigma=GEVquart$par.ests[2]))
+
+#120-month return level-10 years
+monthReturn <- qGEV(1-1/120,xi=GEVmonth$par.ests[1],mu=GEVmonth$par.ests[2], sigma=GEVmonth$par.ests[3])
+
+#return period
+1/(1-pGEV(max(Y.monthMax),
+          xi=GEVmonth$par.ests[1],mu=GEVmonth$par.ests[3],sigma=GEVmonth$par.ests[2]))
+
+# convert timeSeries into data.frame
+Y.monthMax_df = data.frame(mini_index=c(Y.monthMax), Date=rownames(Y.monthMax)) 
+Y.quarterMax_df = data.frame(mini_index=c(Y.quarterMax), Date=rownames(Y.quarterMax))
+
+
+# PDF of GEV Distribution
+m_GEV = fgev(Y.monthMax)
+q_GEV = fgev(Y.quarterMax)
+par(mfrow=c(1,2))
+plot(m_GEV, which=3, main = c("PDF: Monthly-GEV Distributions"))
+plot(q_GEV, which=3, main = c("PDF: Quarterly-GEV Distributions"))
+
+# Monthly Maxima
+MMaxi <- ggplot(Y.monthMax_df, aes(x=1:nrow(Y.monthMax_df), y=mini_index)) + 
+  geom_point() + 
+  labs(title = "mini_index Monthly Maxima", y="Negative Returns",x="Index") +
+  geom_hline(aes(yintercept=monthReturn), colour="#990000", linetype="dashed")+
+  geom_text(aes(3, 0.0765), label="7.65%",col="red")
+
+# Quarterly Maxima
+QMaxi <- ggplot(Y.quarterMax_df, aes(x=1:nrow(Y.quarterMax_df), y=mini_index)) + 
+  geom_point() + 
+  labs(title = "mini_index Quarterly Maxima", y="Negative Returns",x="Index") +
+  geom_hline(aes(yintercept=quarterReturn), colour="#990000", linetype="dashed")+
+  geom_text(aes(2 , 0.077), label="7.95%",col="red")
+grid.arrange(MMaxi, QMaxi,ncol=2,nrow=1)
+```
